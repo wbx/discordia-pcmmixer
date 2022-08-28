@@ -1,6 +1,6 @@
 --[[lit-meta
     name = "wbx/discordia-pcmmixer"
-    version = "0.2.0"
+    version = "0.3.0"
     homepage = "https://github.com/wbx/discordia-pcmmixer"
     description = "Simple audio mixer for Discordia bot voice connections."
     tags = { "discordia" }
@@ -9,8 +9,9 @@
 ]]
 
 local FFmpegProcess = require 'discordia'.class.classes.FFmpegProcess
+local Emitter = require 'discordia'.class.classes.Emitter
 
-local PCMMixer = require 'discordia'.class 'PCMMixer'
+local PCMMixer = require 'discordia'.class('PCMMixer', Emitter)
 
 local SAMPLE_RATE = 48000
 local CHANNELS = 2
@@ -77,6 +78,7 @@ end
 --- Simple PCM mixer to play multiple sources at once
 ---@param aggregateFunction function?   @ Optional aggregate mixer function. Default is additive.
 function PCMMixer:__init(aggregateFunction)
+    Emitter.__init(self)
     self._fn = aggregateFunction or pcmAdd
     self._sources = {}
     self._masterFilters = {}
@@ -88,6 +90,7 @@ end
 --- Add an audio file to the mixer (plays it immediately)
 ---@param src string
 ---@param id string|number|any
+---@return boolean      @ true if source replaced older source with same id
 function PCMMixer:addSource(src, id)
     local stream
     if type(src) == 'string' then
@@ -101,10 +104,12 @@ function PCMMixer:addSource(src, id)
         if s[1] == id then
             if type(s[2].close) == 'function' then s[2]:close() end
             s[2] = stream
-            return
+            self:emit('sourceAdd', id)
+            return true
         end
     end
     self._sources[#self._sources + 1] = {id, stream, {}}
+    self:emit('sourceAdd', id)
 end
 
 --- Remove the audio source specified by id. Returns true if it did remove a source.
@@ -114,6 +119,7 @@ function PCMMixer:removeSource(id)
     for i = 1, #self._sources do
         if self._sources[i][1] == id then
             table.remove(self._sources, i)
+            self:emit('sourceRemove', id)
             return true
         end
     end
@@ -161,7 +167,9 @@ end
 function PCMMixer:attach(connection, duration)
     assert(connection, "connection cannot be nil")
     self._attached = true
+    self:emit('attach', connection)
     local res = connection:_play(self, duration)
+    self:emit('detach')
     self._attached = false
     return res
 end
@@ -174,6 +182,9 @@ function PCMMixer:detach()
     end
 end
 
+
+local remove = table.remove
+local filters = PCMMixer.filters
 
 --- internal use
 function PCMMixer:read(n)
@@ -189,19 +200,21 @@ function PCMMixer:read(n)
     end
 
     local toRemove = {}
-    for i = 1, #self._sources do
-        local stream = self._sources[i][2]
+    local srcs = self._sources
+    local fn = self._fn
+    for i = 1, #srcs do
+        local stream = srcs[i][2]
         local pcm = stream:read(n)
         if pcm ~= nil then
             -- apply source filters
-            local filterValues = self._sources[i][3]
-            for j = 1, #PCMMixer.filters do
-                local filterName = PCMMixer.filters[j]
-                pcm = PCMMixer.filters[filterName](pcm, filterValues[filterName])
+            local filterValues = srcs[i][3]
+            for j = 1, #filters do
+                local filterName = filters[j]
+                pcm = filters[filterName](pcm, filterValues[filterName])
             end
 
             -- merge
-            self._fn(pcmResult, pcm)
+            fn(pcmResult, pcm)
         end
         if pcm == nil or stream._closed then
             toRemove[#toRemove+1] = i
@@ -210,13 +223,13 @@ function PCMMixer:read(n)
 
     -- remove exhausted (ended) streams
     for i = #toRemove, 1, -1 do
-        table.remove(self._sources, toRemove[i])
+        self:emit('sourceEnd', remove(srcs, toRemove[i])[1])
     end
 
     -- apply master filters
-    for j = 1, #PCMMixer.filters do
-        local filterName = PCMMixer.filters[j]
-        pcmResult = PCMMixer.filters[filterName](pcmResult, self._masterFilters[filterName])
+    for j = 1, #filters do
+        local filterName = filters[j]
+        pcmResult = filters[filterName](pcmResult, self._masterFilters[filterName])
     end
 
     return pcmResult
