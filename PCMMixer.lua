@@ -1,6 +1,6 @@
 --[[lit-meta
     name = "wbx/discordia-pcmmixer"
-    version = "0.1.0"
+    version = "0.2.0"
     homepage = "https://github.com/wbx/discordia-pcmmixer"
     description = "Simple audio mixer for Discordia bot voice connections."
     tags = { "discordia" }
@@ -10,29 +10,80 @@
 
 local FFmpegProcess = require 'discordia'.class.classes.FFmpegProcess
 
+local PCMMixer = require 'discordia'.class 'PCMMixer'
+
 local SAMPLE_RATE = 48000
 local CHANNELS = 2
 
-local PCMMixer = require 'discordia'.class 'PCMMixer'
 
--- Aggregate mixer function that simply combines two sources additively.
-local function pcmAdd(pcm, pcmOther)
+
+--region-- FILTERS --
+
+PCMMixer.filters = {'volume', 'pan'}
+
+local min, max = math.min, math.max
+local function clamp(v, l, h)
+    return min(max(v, l), h)
+end
+
+--- Control loudness (linear). Range is 0 (muted) to X (X * amplitude) (1 is default)
+---@param pcm number[]
+---@param val number
+function PCMMixer.filters.volume(pcm, val)
+    if not val or val == 1.0 then return pcm end
+    val = clamp(val, 0, 32767)
     for i = 1, #pcm do
-        pcm[i] = pcm[i] + (pcmOther[i] or 0)
-        if pcm[i] > 32767 then pcm[i] = 32767 end
-        if pcm[i] < -32768 then pcm[i] = -32768 end
+        pcm[i] = clamp(pcm[i] * val, -32768, 32767)
     end
     return pcm
 end
+
+local sin, cos  = math.sin, math.cos
+local _PIQR = math.pi / 4
+local _TSQT = 2 / math.sqrt(2)
+
+--- Control audio panning. Range is -1 (full left) to 1 (full right) (0 is default: center)
+---@param pcm number[]
+---@param val number
+function PCMMixer.filters.pan(pcm, val)
+    if not val or val == 0.0 then return pcm end
+    val = clamp(val, -1, 1)
+
+    local L = _TSQT * cos(_PIQR * (val+1))
+    local R = _TSQT * sin(_PIQR * (val+1))
+    for i = 1, #pcm, 2 do
+        pcm[i] = clamp(pcm[i] * L, -32768, 32767)
+        pcm[i+1] = clamp(pcm[i+1] * R, -32768, 32767)
+    end
+    return pcm
+end
+
+--endregion-- FILTERS --
+
+
+
+-- Aggregate mixer function that simply combines two sources additively.
+---@param pcm number[]
+---@param pcmOther number[]
+local function pcmAdd(pcm, pcmOther)
+    for i = 1, #pcm do
+        pcm[i] = clamp(pcm[i] + (pcmOther[i] or 0), -32768, 32767)
+    end
+    return pcm
+end
+
+
 
 --- Simple PCM mixer to play multiple sources at once
 ---@param aggregateFunction function?   @ Optional aggregate mixer function. Default is additive.
 function PCMMixer:__init(aggregateFunction)
     self._fn = aggregateFunction or pcmAdd
     self._sources = {}
+    self._masterFilters = {}
     self._shouldDetach = false
     self._attached = false
 end
+
 
 --- Add an audio file to the mixer (plays it immediately)
 ---@param src string
@@ -53,7 +104,7 @@ function PCMMixer:addSource(src, id)
             return
         end
     end
-    self._sources[#self._sources + 1] = {id, stream}
+    self._sources[#self._sources + 1] = {id, stream, {}}
 end
 
 --- Remove the audio source specified by id. Returns true if it did remove a source.
@@ -69,35 +120,39 @@ function PCMMixer:removeSource(id)
     return false
 end
 
---- internal use
-function PCMMixer:read(n)
-    if self._shouldDetach then
-        self._shouldDetach = false
-        return nil
-    end
-    local pcmResult = {}
-    for i = 1, n do
-        pcmResult[i] = 0
+
+--- Set a filter setting for the mixer output.
+--- Set value to `nil` to use default.
+---@param filterName string
+---@param filterValue number|any
+function PCMMixer:masterFilter(filterName, filterValue)
+    if not PCMMixer.filters[filterName] then
+        error("invalid filter name '"..filterName.."'")
     end
 
-    local toRemove = {}
-    for i = 1, #self._sources do
-        local stream = self._sources[i][2]
-        local pcm = stream:read(n)
-        if pcm ~= nil then
-            self._fn(pcmResult, pcm)
-        end
-        if pcm == nil or stream._closed then
-            toRemove[#toRemove+1] = i
-        end
-    end
-
-    for i = #toRemove, 1, -1 do
-        table.remove(self._sources, toRemove[i])
-    end
-
-    return pcmResult
+    self._masterFilters[filterName] = filterValue
 end
+
+--- Set a filter setting for the source specified by srcId.
+--- Set value to `nil` to use default.
+---@param srcId string|number|any
+---@param filterName string
+---@param filterValue number|any
+function PCMMixer:sourceFilter(srcId, filterName, filterValue)
+    if not PCMMixer.filters[filterName] then
+        error("invalid filter name '"..filterName.."'")
+    end
+
+    for i = 1, #self._sources do
+        local s = self._sources[i]
+        if s[1] == srcId then
+            s[3][filterName] = filterValue
+            return true
+        end
+    end
+    return false
+end
+
 
 --- Attach to a VoiceConnection and start playback.
 --- Blocking - it's where you normally use Connection:playFFmpeg etc.
@@ -118,5 +173,54 @@ function PCMMixer:detach()
         self._shouldDetach = true
     end
 end
+
+
+--- internal use
+function PCMMixer:read(n)
+    if self._shouldDetach then
+        self._shouldDetach = false
+        return nil
+    end
+
+    -- fill silence
+    local pcmResult = {}
+    for i = 1, n do
+        pcmResult[i] = 0
+    end
+
+    local toRemove = {}
+    for i = 1, #self._sources do
+        local stream = self._sources[i][2]
+        local pcm = stream:read(n)
+        if pcm ~= nil then
+            -- apply source filters
+            local filterValues = self._sources[i][3]
+            for j = 1, #PCMMixer.filters do
+                local filterName = PCMMixer.filters[j]
+                pcm = PCMMixer.filters[filterName](pcm, filterValues[filterName])
+            end
+
+            -- merge
+            self._fn(pcmResult, pcm)
+        end
+        if pcm == nil or stream._closed then
+            toRemove[#toRemove+1] = i
+        end
+    end
+
+    -- remove exhausted (ended) streams
+    for i = #toRemove, 1, -1 do
+        table.remove(self._sources, toRemove[i])
+    end
+
+    -- apply master filters
+    for j = 1, #PCMMixer.filters do
+        local filterName = PCMMixer.filters[j]
+        pcmResult = PCMMixer.filters[filterName](pcmResult, self._masterFilters[filterName])
+    end
+
+    return pcmResult
+end
+
 
 return PCMMixer
