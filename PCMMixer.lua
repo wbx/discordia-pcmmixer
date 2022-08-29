@@ -1,6 +1,6 @@
 --[[lit-meta
     name = "wbx/discordia-pcmmixer"
-    version = "0.3.0"
+    version = "0.4.1"
     homepage = "https://github.com/wbx/discordia-pcmmixer"
     description = "Simple audio mixer for Discordia bot voice connections."
     tags = { "discordia" }
@@ -88,7 +88,7 @@ end
 
 
 --- Add an audio file to the mixer (plays it immediately)
----@param src string
+---@param src string|table
 ---@param id string|number|any
 ---@return boolean      @ true if source replaced older source with same id
 function PCMMixer:addSource(src, id)
@@ -104,13 +104,62 @@ function PCMMixer:addSource(src, id)
         if s[1] == id then
             if type(s[2].close) == 'function' then s[2]:close() end
             s[2] = stream
+            self:emit('sourceRemove', id)
             self:emit('sourceAdd', id)
             return true
         end
     end
     self._sources[#self._sources + 1] = {id, stream, {}}
     self:emit('sourceAdd', id)
+    return false
 end
+
+
+local function utoi16(v)
+    return v > 32767 and -65536 + v or v
+end
+
+local floor = math.floor
+local function _rawRead(self, n)
+    if self.pos - 1 + n * 2 > #self.data then
+        if self.pos > #self.data then return nil end
+        n = floor((#self.data - self.pos + 1) / 2)
+    end
+    if n == 0 then return nil end
+
+    local data = {}
+
+    for i = self.pos, self.pos - 1 + n * 2, 2 do
+        local low, high = self.data:byte(i, i+1)
+        data[#data+1] = utoi16(low + (high or 0) * 256)
+    end
+    self.pos = self.pos + n * 2
+
+    return data
+end
+
+--- Add a raw PCM string to the mixer (plays it immediately)
+--- Only (2 channels, 48000 sample rate, s16le format) works (for now)
+---@param data string       @ raw PCM data, possibly read from a file
+---@param id string|number|any
+function PCMMixer:addSourceRaw(data, id)
+    assert(type(data) == 'string', "data must be a raw pcm string")
+    return self:addSource({pos = 1, data = data, read = _rawRead}, id)
+end
+
+--
+-- was too much for my 5am brain
+--[[
+function PCMMixer:addSourceRaw(data, id, channels, sampleRate, format)
+    if not channels then channels = CHANNELS end
+    if not sampleRate then sampleRate = SAMPLE_RATE end
+    if not format then format = 's16le' end
+    assert(channels > 0 and channels < 3, 'addSourceRaw can only accept 1 or 2 channels')
+    assert(sampleRate % SAMPLE_RATE == 0, SAMPLE_RATE..' must be divisible by given sampleRate')
+    local dt, bits, endi = format:match('([su])(%d+)([lb]?e?)')
+end
+--]]
+
 
 --- Remove the audio source specified by id. Returns true if it did remove a source.
 ---@param id string|number|any
