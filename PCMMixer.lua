@@ -1,6 +1,6 @@
 --[[lit-meta
     name = "wbx/discordia-pcmmixer"
-    version = "0.4.1"
+    version = "0.4.2"
     homepage = "https://github.com/wbx/discordia-pcmmixer"
     description = "Simple audio mixer for Discordia bot voice connections."
     tags = { "discordia" }
@@ -139,26 +139,33 @@ local function _rawRead(self, n)
 end
 
 --- Add a raw PCM string to the mixer (plays it immediately)
---- Only (2 channels, 48000 sample rate, s16le format) works (for now)
----@param data string       @ raw PCM data, possibly read from a file
+--- Number of channels (1-2) and sample rate can be specified, given s16le PCM.
+---@param data string           @ raw PCM data, possibly read from a file
 ---@param id string|number|any
-function PCMMixer:addSourceRaw(data, id)
-    assert(type(data) == 'string', "data must be a raw pcm string")
-    return self:addSource({pos = 1, data = data, read = _rawRead}, id)
-end
-
---
--- was too much for my 5am brain
---[[
-function PCMMixer:addSourceRaw(data, id, channels, sampleRate, format)
+---@param channels integer?     @ optional channel count, defaults to 2
+---@param sampleRate integer?   @ optional sample rate, defaults to 48000
+function PCMMixer:addSourceRaw(data, id, channels, sampleRate)
     if not channels then channels = CHANNELS end
     if not sampleRate then sampleRate = SAMPLE_RATE end
-    if not format then format = 's16le' end
-    assert(channels > 0 and channels < 3, 'addSourceRaw can only accept 1 or 2 channels')
-    assert(sampleRate % SAMPLE_RATE == 0, SAMPLE_RATE..' must be divisible by given sampleRate')
-    local dt, bits, endi = format:match('([su])(%d+)([lb]?e?)')
+    --if not format then format = 's16le' end
+    assert(type(data) == 'string', "data must be a raw pcm string")
+    assert(channels == 1 or channels == 2, 'addSourceRaw can only accept 1 or 2 channels')
+    assert(SAMPLE_RATE % sampleRate == 0, SAMPLE_RATE..' must be divisible by given sampleRate')
+    --local dt, bits = format:match('([su])(%d+)')
+
+    if channels == 1 then
+        data = data:gsub('..', '%0%0')
+    end
+
+    local factor = SAMPLE_RATE / sampleRate
+
+    return self:addSource({
+        pos = 1,
+        data = factor == 1 and data or data:gsub('....', ('%0'):rep(factor)),
+        read = _rawRead
+    }, id)
 end
---]]
+--
 
 
 --- Remove the audio source specified by id. Returns true if it did remove a source.
